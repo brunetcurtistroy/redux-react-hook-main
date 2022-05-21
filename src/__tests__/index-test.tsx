@@ -1,0 +1,553 @@
+// Copyright (c) Facebook, Inc. and its affiliates. All Rights Reserved
+
+import * as React from 'react';
+import * as ReactDOM from 'react-dom';
+import {act} from 'react-dom/test-utils';
+import {createStore as createReduxStore, Observable, Store} from 'redux';
+import {create, StoreContext, useDispatch, useMappedState} from '..';
+
+interface IAction {
+  type: 'add todo';
+}
+
+interface IState {
+  bar: number;
+  foo: string;
+}
+
+const noopObservable: Observable<any> = {
+  subscribe() {
+    return {unsubscribe: () => {}};
+  },
+  [Symbol.observable]: () => noopObservable,
+};
+
+describe('redux-react-hook', () => {
+  let subscriberCallbacks: Array<() => void> = [];
+  let state: IState;
+  let cancelSubscription: () => void;
+  let store: Store<IState, IAction>;
+  let reactRoot: HTMLDivElement;
+
+  const createStore = (): Store<IState, IAction> => ({
+    dispatch: jest.fn(action => action),
+    getState: () => state,
+    subscribe: jest.fn((l: () => void) => {
+      subscriberCallbacks.push(l);
+      return cancelSubscription;
+    }),
+    // tslint:disable-next-line:no-empty
+    replaceReducer() {},
+    [Symbol.observable]() {
+      return noopObservable;
+    },
+  });
+
+  function updateStoreWithoutAct(newState: IState) {
+    state = newState;
+    for (const sub of subscriberCallbacks) {
+      sub();
+    }
+  }
+
+  function updateStore(newState: IState) {
+    act(() => {
+      updateStoreWithoutAct(newState);
+    });
+  }
+
+  beforeEach(() => {
+    cancelSubscription = jest.fn();
+    state = {bar: 123, foo: 'bar'};
+    store = createStore();
+
+    reactRoot = document.createElement('div');
+    document.body.appendChild(reactRoot);
+  });
+
+  afterEach(() => {
+    document.body.removeChild(reactRoot);
+    subscriberCallbacks = [];
+  });
+
+  function render(element: React.ReactElement<any>) {
+    act(() => {
+      ReactDOM.render(
+        <StoreContext.Provider value={store}>{element}</StoreContext.Provider>,
+        reactRoot,
+      );
+    });
+  }
+
+  function getText() {
+    return reactRoot.textContent;
+  }
+
+  describe('useMappedState', () => {
+    it('renders with state from the store', () => {
+      const mapState = (s: IState) => s.foo;
+      const Component = () => {
+        const foo = useMappedState(mapState);
+        return <div>{foo}</div>;
+      };
+
+      render(<Component />);
+
+      expect(getText()).toBe('bar');
+    });
+
+    it('rerenders with new state when the subscribe callback is called', () => {
+      const mapState = (s: IState) => s.foo;
+      const Component = () => {
+        const foo = useMappedState(mapState);
+        return <div>{foo}</div>;
+      };
+
+      render(<Component />);
+
+      updateStore({...state, foo: 'foo'});
+
+      expect(getText()).toBe('foo');
+    });
+
+    it('cancels subscription on unmount', () => {
+      const mapState = (s: IState) => s.foo;
+      const Component = () => {
+        const foo = useMappedState(mapState);
+        return <div>{foo}</div>;
+      };
+
+      render(<Component />);
+
+      ReactDOM.unmountComponentAtNode(reactRoot);
+
+      expect(cancelSubscription).toHaveBeenCalled();
+    });
+
+    it('does not rerender if the selected state has not changed', () => {
+      const mapState = (s: IState) => s.foo;
+      let renderCount = 0;
+      const Component = () => {
+        const foo = useMappedState(mapState);
+        renderCount++;
+        return (
+          <div>
+            {foo} {renderCount}
+          </div>
+        );
+      };
+
+      render(<Component />);
+
+      expect(getText()).toBe('bar 1');
+
+      updateStore({...state, bar: 456});
+
+      expect(getText()).toBe('bar 1');
+    });
+
+    it('uses the passed in version of equalityCheck that is always false', () => {
+      const mapState = () => 'constant';
+      const equalityCheck = () => false;
+      let renderCount = 0;
+      const Component = () => {
+        const result = useMappedState(mapState, equalityCheck);
+        renderCount++;
+        return (
+          <div>
+            {result} {renderCount}
+          </div>
+        );
+      };
+
+      render(<Component />);
+
+      expect(getText()).toBe('constant 2');
+
+      updateStore({...state, bar: 456});
+
+      // Nothing changed, but equalityCheck returned false
+      expect(getText()).toBe('constant 3');
+    });
+
+    it('uses the passed in version of equalityCheck to compare maps', () => {
+      const mapState = (s: IState) => new Map([['foo', s.foo]]);
+      const equalityCheck = (
+        a: Map<string, string>,
+        b: Map<string, string>,
+      ) => {
+        return a.get('foo') === b.get('foo');
+      };
+      let renderCount = 0;
+      const Component = () => {
+        const foo = useMappedState(mapState, equalityCheck).get('foo');
+        renderCount++;
+        return (
+          <div>
+            {foo} {renderCount}
+          </div>
+        );
+      };
+
+      render(<Component />);
+
+      expect(getText()).toBe('bar 1');
+
+      updateStore({...state, foo: 'baz'});
+
+      expect(getText()).toBe('baz 2');
+    });
+
+    it('rerenders if the mapState function changes', () => {
+      const Component = ({n}: {n: number}) => {
+        const mapState = React.useCallback((s: IState) => s.foo + ' ' + n, [n]);
+        const foo = useMappedState(mapState);
+        return <div>{foo}</div>;
+      };
+
+      render(<Component n={100} />);
+
+      expect(getText()).toBe('bar 100');
+
+      render(<Component n={45} />);
+
+      expect(getText()).toBe('bar 45');
+    });
+
+    it('rerenders if the store changes', () => {
+      const mapState = (s: IState) => s.foo;
+      const Component = () => {
+        const foo = useMappedState(mapState);
+        return <div>{foo}</div>;
+      };
+
+      render(<Component />);
+
+      expect(getText()).toBe('bar');
+
+      store = createStore();
+      state = {...state, foo: 'hello'};
+
+      render(<Component />);
+
+      expect(getText()).toBe('hello');
+    });
+
+    it('uses the latest state if the store updates before subscribing', () => {
+      const Component = () => {
+        const mapState = React.useCallback((s: IState) => s.foo, []);
+        const foo = useMappedState(mapState);
+        return <div>{foo}</div>;
+      };
+
+      render(<Component />);
+
+      updateStore({...state, foo: 'foo'});
+
+      expect(getText()).toBe('foo');
+    });
+
+    it('calls the correct mapState if mapState changes and the store updates', () => {
+      const Component = ({n}: {n: number}) => {
+        const mapState = React.useCallback((s: IState) => s.foo + ' ' + n, [n]);
+        const foo = useMappedState(mapState);
+        return <div>{foo}</div>;
+      };
+
+      render(<Component n={100} />);
+      render(<Component n={45} />);
+
+      updateStore({...state, foo: 'foo'});
+
+      expect(getText()).toBe('foo 45');
+    });
+
+    it("doesn't try to update after unmounting during dispatch", () => {
+      let mapStateCalls = 0;
+      const Component = () => {
+        const mapState = React.useCallback((s: IState) => {
+          mapStateCalls++;
+          return s.foo;
+        }, []);
+        const foo = useMappedState(mapState);
+        return <div>{foo}</div>;
+      };
+
+      render(<Component />);
+      ReactDOM.unmountComponentAtNode(reactRoot);
+
+      const consoleErrorSpy = jest.spyOn(console, 'error');
+      updateStore({...state, foo: 'foo'});
+
+      // mapState is called during and after the first render
+      expect(mapStateCalls).toBe(1);
+      expect(consoleErrorSpy).not.toHaveBeenCalled();
+    });
+
+    it('renders last state after synchronous dispatches', () => {
+      const store = createReduxStore((state: number = 0, action: any): number =>
+        action.type === 'test' ? action.payload : state,
+      );
+
+      const mapState = (s: number) => s;
+      const Component = () => {
+        const bar = useMappedState(mapState);
+        return <div>{bar}</div>;
+      };
+
+      render(
+        <StoreContext.Provider value={store}>
+          <Component />
+        </StoreContext.Provider>,
+      );
+
+      act(() => {
+        store.dispatch({
+          type: 'test',
+          payload: 1,
+        });
+        store.dispatch({
+          type: 'test',
+          payload: 0,
+        });
+      });
+
+      expect(getText()).toBe('0');
+    });
+
+    it('renders once if new mapState returns same mappedState', () => {
+      let renderCount = 0;
+      const Component = ({prop}: {prop: any}) => {
+        const mapState = React.useCallback((s: IState) => s, [prop]);
+        useMappedState(mapState);
+        renderCount++;
+        return null;
+      };
+
+      render(<Component prop={1} />);
+      render(<Component prop={2} />);
+
+      expect(renderCount).toBe(2);
+    });
+
+    it('renders once if have multiple useMappedState', () => {
+      let renderCount = 0;
+      const Component = ({prop}: {prop: any}) => {
+        const mapState1 = React.useCallback((s: IState) => s.bar, [prop]);
+        const mapState2 = React.useCallback((s: IState) => s.foo, [prop]);
+        useMappedState(mapState1);
+        useMappedState(mapState2);
+        renderCount++;
+        return null;
+      };
+
+      render(<Component prop={1} />);
+
+      // Supress the act error since we are purposely updating outside of act
+      suppressActError(() => {
+        updateStoreWithoutAct({bar: 11, foo: '11'});
+        updateStoreWithoutAct({bar: 12, foo: '12'});
+      });
+
+      act(() => {});
+      expect(renderCount).toBe(3);
+    });
+
+    it('renders with latest state', () => {
+      const Component = ({prop}: {prop: any}) => {
+        const mapState1 = React.useCallback((s: IState) => s.bar, [prop]);
+        const mapState2 = React.useCallback((s: IState) => s.foo, [prop]);
+        const bar = useMappedState(mapState1);
+        const foo = useMappedState(mapState2);
+        return (
+          <span>
+            {bar}
+            {foo}
+          </span>
+        );
+      };
+
+      render(<Component prop={1} />);
+
+      // Supress the act error since we are purposely updating outside of act
+      suppressActError(() => {
+        updateStoreWithoutAct({bar: 10, foo: '11'});
+        updateStoreWithoutAct({bar: 12, foo: '13'});
+      });
+
+      expect(getText()).toBe('1213');
+    });
+
+    it('throws if provider is missing', () => {
+      const Component = () => {
+        const mapState = React.useCallback((s: IState) => s, []);
+        expect(() => {
+          useMappedState(mapState);
+        }).toThrow();
+        return null;
+      };
+      act(() => {
+        ReactDOM.render(<Component />, reactRoot);
+      });
+    });
+
+    it('does not provide stale mapped state', () => {
+      let flag = false;
+
+      const Component = ({prop}: {prop: any}) => {
+        const mapState = React.useCallback((s: IState) => s[prop], [prop]);
+        const mappedState = useMappedState(mapState);
+        if (state[prop] !== mappedState) {
+          flag = true;
+        }
+        return null;
+      };
+
+      render(<Component prop="foo" />);
+      render(<Component prop="bar" />);
+
+      expect(flag).toBe(false);
+    });
+
+    it("doesn't call mapState too often", () => {
+      let mapStateCalls = 0;
+
+      const Component = () => {
+        const mapState = React.useCallback((s: IState) => {
+          mapStateCalls++;
+          return s.foo;
+        }, []);
+        const foo = useMappedState(mapState);
+        return <div>{foo}</div>;
+      };
+
+      render(<Component />);
+      render(<Component />);
+      render(<Component />);
+      render(<Component />);
+
+      // mapState called twice on subscription:
+      // 1. Pull data on initial render
+      // 2. Pull data before right before subscribing in useEffect
+      expect(mapStateCalls).toBe(1);
+    });
+
+    it("doesn't resubscribe if mapState changes", () => {
+      const Component = ({prop}: {prop: any}) => {
+        useMappedState(React.useCallback(() => {}, [prop]));
+        return null;
+      };
+
+      render(<Component prop={1} />);
+      render(<Component prop={2} />);
+
+      expect(store.subscribe).toHaveBeenCalledTimes(1);
+    });
+  });
+
+  describe('useDispatch', () => {
+    it('calls store dispatch', () => {
+      const Component = () => {
+        const dispatch = useDispatch();
+        React.useEffect(() => {
+          dispatch({foo: 1});
+        });
+        return null;
+      };
+
+      render(<Component />);
+
+      expect(store.dispatch).toHaveBeenLastCalledWith({foo: 1});
+    });
+
+    it('throws if provider is missing', () => {
+      const Component = () => {
+        expect(() => {
+          useDispatch();
+        }).toThrow();
+        return null;
+      };
+      act(() => {
+        ReactDOM.render(<Component />, reactRoot);
+      });
+    });
+  });
+
+  describe('create', () => {
+    it('returns a new context and functions each time', () => {
+      const first = create();
+      const second = create();
+      expect(first.StoreContext).not.toBe(second.StoreContext);
+      expect(first.useDispatch).not.toBe(second.useDispatch);
+      expect(first.useMappedState).not.toBe(second.useMappedState);
+    });
+
+    it('sets the default equalityCheck function', () => {
+      const {StoreContext, useMappedState} = create({
+        defaultEqualityCheck: () => false,
+      });
+
+      const mapState = () => 'constant';
+      const equalityCheck = () => false;
+      let renderCount = 0;
+      const Component = () => {
+        const result = useMappedState(mapState, equalityCheck);
+        renderCount++;
+        return (
+          <div>
+            {result} {renderCount}
+          </div>
+        );
+      };
+
+      render(
+        <StoreContext.Provider value={store}>
+          <Component />
+        </StoreContext.Provider>,
+      );
+
+      updateStore(state);
+
+      // Nothing changed, but equalityCheck returned false. This happens twice
+      // because we check the state again after subscribing.
+      expect(getText()).toBe('constant 3');
+    });
+  });
+
+  describe('memoize', () => {
+    it('should not skip initial call even if initial state is undefined', () => {
+      const store = createReduxStore(() => {});
+
+      const mapState = (s: number | undefined) => s || 'empty';
+      const Component = () => {
+        const bar = useMappedState(mapState);
+        return <div>{bar}</div>;
+      };
+
+      act(() => {
+        ReactDOM.render(
+          <StoreContext.Provider value={store}>
+            <Component />
+          </StoreContext.Provider>,
+          reactRoot,
+        );
+      });
+
+      expect(getText()).toBe('empty');
+    });
+  });
+});
+
+function suppressActError(fn: () => void) {
+  const original = console.error;
+  console.error = (...args: any[]) => {
+    if (args.some(a => a.includes('act'))) {
+      return;
+    }
+    original(...args);
+  };
+
+  fn();
+
+  console.error = original;
+}
